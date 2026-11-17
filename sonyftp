@@ -8,7 +8,7 @@
 #   ./sonyftp log       follow the transfer log
 #   ./sonyftp passwd    generate a new FTP password
 #   ./sonyftp cert      reissue the server cert (e.g. after an IP change)
-#   ./sonyftp test      verify FTPS upload works and plain FTP is refused
+#   ./sonyftp test      verify FTPS upload, OCSP answer, and that plain FTP is refused
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +21,7 @@ FTP_USER="a7iv"
 FTP_PASSWORD=""
 PORT=21
 PASV_PORTS="50000:50010"
+OCSP_PORT=8022
 IFACE=""
 if [[ -f "$ENV_FILE" ]]; then set -a; source "$ENV_FILE"; set +a; fi
 UPLOAD_DIR="${UPLOAD_DIR/#\~/$HOME}"
@@ -30,10 +31,16 @@ find_bin() { for c in "$@"; do [[ -x "$c" ]] && { echo "$c"; return; }; command 
 PUREFTPD="$(find_bin /opt/homebrew/opt/pure-ftpd/sbin/pure-ftpd /usr/local/opt/pure-ftpd/sbin/pure-ftpd /usr/sbin/pure-ftpd pure-ftpd)"
 PUREPW="$(find_bin /opt/homebrew/bin/pure-pw /usr/local/bin/pure-pw /usr/bin/pure-pw pure-pw)"
 OPENSSL="$(find_bin /opt/homebrew/opt/openssl@4/bin/openssl /opt/homebrew/opt/openssl@3/bin/openssl openssl)"
+# The OCSP responder uses the system openssl on macOS: it is Apple-signed, so the
+# macOS firewall lets it accept connections without an exception.
+OCSP_BIN="$OPENSSL"
+if [[ $OS == Darwin && -x /usr/bin/openssl ]]; then OCSP_BIN=/usr/bin/openssl; fi
 
 PIDFILE="$RUN/pure-ftpd.pid"
+OCSP_PID="$RUN/ocsp.pid"
 PDB="$CONF/pureftpd.pdb"; PASSWD="$CONF/pureftpd.passwd"
 SERVER_PEM="$CERTS/pure-ftpd.pem"
+INDEX="$CERTS/index.txt"   # certificate status database read by the OCSP responder
 
 die() { echo "error: $*" >&2; exit 1; }
 need() { [[ -n "$PUREFTPD" && -n "$PUREPW" && -n "$OPENSSL" ]] || die "missing pure-ftpd/pure-pw/openssl (see README)"; }
@@ -49,8 +56,17 @@ lan_ip() {
   fi
 }
 running() { [[ -f "$PIDFILE" ]] && ps -p "$(cat "$PIDFILE")" >/dev/null 2>&1; }
+ocsp_running() { [[ -f "$OCSP_PID" ]] && ps -p "$(cat "$OCSP_PID")" >/dev/null 2>&1; }
 random_pw() { "$OPENSSL" rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 16; }
-cert_has_ip() { [[ -f "$CERTS/server.crt" ]] && "$OPENSSL" x509 -in "$CERTS/server.crt" -noout -text | grep -Eq "IP Address:$1(,|$)"; }
+utc_offset() {  # utc_offset <+N|-N days> <date format>
+  if [[ $OS == Darwin ]]; then date -u -v"$1"d +"$2"; else date -u -d "$1 days" +"$2"; fi
+}
+# The server cert must match the current IP and point at our OCSP responder.
+cert_ok() {
+  [[ -f "$CERTS/server.crt" && -f "$INDEX" ]] || return 1
+  local t; t="$("$OPENSSL" x509 -in "$CERTS/server.crt" -noout -text)"
+  grep -Eq "IP Address:$1(,|$)" <<<"$t" && grep -q "OCSP - URI:http://$1:$OCSP_PORT" <<<"$t"
+}
 
 set_env() {  # set_env KEY VALUE — update or append in .env
   local tmp; tmp="$(mktemp)"
@@ -58,30 +74,61 @@ set_env() {  # set_env KEY VALUE — update or append in .env
   mv "$tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
 }
 
+# Backdate notBefore a week so a camera clock/timezone that's a bit off still accepts the cert.
+backdate() {
+  "$OPENSSL" x509 -help 2>&1 | grep -q not_before || return 0   # OpenSSL < 3.4: skip
+  echo "-not_before $(utc_offset -7 %Y%m%d%H%M%SZ)"
+}
+
 make_ca() {
   [[ -f "$CERTS/ca.key" ]] && return
   echo "Creating private root CA..."
-  "$OPENSSL" req -x509 -new -newkey rsa:2048 -nodes -sha256 -days 3650 \
+  # shellcheck disable=SC2046
+  "$OPENSSL" req -x509 -new -newkey rsa:2048 -nodes -sha256 -days 3650 $(backdate) \
     -keyout "$CERTS/ca.key" -out "$CERTS/ca.crt" \
     -subj "/CN=SonyFTP Local Root CA ($(hostname_s))" \
-    -addext "basicConstraints=critical,CA:TRUE" \
-    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -addext "subjectKeyIdentifier=hash" 2>/dev/null
   chmod 600 "$CERTS/ca.key"
   cp "$CERTS/ca.crt" "$CERTS/cacert.pem"   # file name the camera expects on the card
 }
 
+# The camera rejects the cert ("Root Certificate Error") unless it can check revocation:
+# the cert must carry an OCSP URL and the responder there must answer "good".
 make_server_cert() {
-  local ip host; ip="$(lan_ip)"; host="$(hostname_s)"
+  local ip host serial; ip="$(lan_ip)"; host="$(hostname_s)"
   [[ -n "$ip" ]] || die "could not detect LAN IP (set IFACE in .env)"
   echo "Issuing server certificate for $ip / $host.local ..."
   "$OPENSSL" req -new -newkey rsa:2048 -nodes -sha256 \
     -keyout "$CERTS/server.key" -out "$CERTS/server.csr" -subj "/CN=$ip" 2>/dev/null
+  # shellcheck disable=SC2046
   "$OPENSSL" x509 -req -in "$CERTS/server.csr" -CA "$CERTS/ca.crt" -CAkey "$CERTS/ca.key" \
-    -CAcreateserial -out "$CERTS/server.crt" -days 825 -sha256 \
-    -extfile <(printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:%s,DNS:%s.local,DNS:%s\n' "$ip" "$host" "$host") 2>/dev/null
+    -CAcreateserial -out "$CERTS/server.crt" -days 397 -sha256 $(backdate) \
+    -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\nsubjectAltName=DNS:%s,IP:%s,DNS:%s.local,DNS:%s\nauthorityInfoAccess=OCSP;URI:http://%s:%s\n' "$ip" "$ip" "$host" "$host" "$ip" "$OCSP_PORT") 2>/dev/null
   rm -f "$CERTS/server.csr"
-  cat "$CERTS/server.key" "$CERTS/server.crt" "$CERTS/ca.crt" > "$SERVER_PEM"
+  cat "$CERTS/server.key" "$CERTS/server.crt" > "$SERVER_PEM"   # leaf only; camera has the root
   chmod 600 "$CERTS/server.key" "$SERVER_PEM"
+  # Status database for the OCSP responder: this cert is the only valid one.
+  serial="$("$OPENSSL" x509 -in "$CERTS/server.crt" -noout -serial | cut -d= -f2)"
+  printf 'V\t%s\t\t%s\tunknown\t/CN=%s\n' "$(utc_offset +397 %y%m%d%H%M%SZ)" "$serial" "$ip" > "$INDEX"
+  echo 'unique_subject = no' > "$INDEX.attr"
+  if ocsp_running; then ocsp_stop; ocsp_start; fi   # responder reads the database at startup
+}
+
+ocsp_start() {
+  ocsp_running && return
+  mkdir -p "$RUN" "$LOGS"
+  nohup "$OCSP_BIN" ocsp -index "$INDEX" -port "$OCSP_PORT" \
+    -rsigner "$CERTS/ca.crt" -rkey "$CERTS/ca.key" -CA "$CERTS/ca.crt" >> "$LOGS/ocsp.log" 2>&1 &
+  echo $! > "$OCSP_PID"
+  sleep 1
+  ocsp_running || die "OCSP responder failed to start — is port $OCSP_PORT in use? (see logs/ocsp.log)"
+}
+
+ocsp_stop() {
+  if ocsp_running; then kill "$(cat "$OCSP_PID")" 2>/dev/null || true; fi
+  rm -f "$OCSP_PID"
 }
 
 set_password() {  # set_password [password] — empty → random
@@ -96,13 +143,18 @@ set_password() {  # set_password [password] — empty → random
 
 fw_open() {
   if [[ $OS == Darwin ]]; then
-    local real; real="$(realpath "$PUREFTPD")"
-    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$real" >/dev/null 2>&1 || true
-    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$real" >/dev/null 2>&1 || true
+    local b real
+    for b in "$PUREFTPD" "$OCSP_BIN"; do
+      [[ "$b" == /usr/bin/* ]] && continue   # Apple-signed system binaries are allowed already
+      real="$(realpath "$b")"
+      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$real" >/dev/null 2>&1 || true
+      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$real" >/dev/null 2>&1 || true
+    done
   elif command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
     sudo ufw allow "$PORT/tcp" >/dev/null; sudo ufw allow "$PASV_PORTS/tcp" >/dev/null
+    sudo ufw allow "$OCSP_PORT/tcp" >/dev/null
   elif command -v firewall-cmd >/dev/null && sudo firewall-cmd --state >/dev/null 2>&1; then
-    sudo firewall-cmd --add-port="$PORT/tcp" --add-port="${PASV_PORTS/:/-}/tcp" >/dev/null   # runtime only
+    sudo firewall-cmd --add-port="$PORT/tcp" --add-port="${PASV_PORTS/:/-}/tcp" --add-port="$OCSP_PORT/tcp" >/dev/null   # runtime only
   fi
 }
 
@@ -111,8 +163,9 @@ fw_close() {
   if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
     sudo ufw delete allow "$PORT/tcp" >/dev/null 2>&1 || true
     sudo ufw delete allow "$PASV_PORTS/tcp" >/dev/null 2>&1 || true
+    sudo ufw delete allow "$OCSP_PORT/tcp" >/dev/null 2>&1 || true
   elif command -v firewall-cmd >/dev/null && sudo firewall-cmd --state >/dev/null 2>&1; then
-    sudo firewall-cmd --remove-port="$PORT/tcp" --remove-port="${PASV_PORTS/:/-}/tcp" >/dev/null 2>&1 || true
+    sudo firewall-cmd --remove-port="$PORT/tcp" --remove-port="${PASV_PORTS/:/-}/tcp" --remove-port="$OCSP_PORT/tcp" >/dev/null 2>&1 || true
   fi
 }
 
@@ -122,23 +175,31 @@ cmd_setup() {
   mkdir -p "$CONF" "$CERTS" "$RUN" "$LOGS" "$UPLOAD_DIR"
   chmod 700 "$CONF" "$CERTS"
   make_ca
-  cert_has_ip "$(lan_ip)" || make_server_cert
+  cert_ok "$(lan_ip)" || make_server_cert
   [[ -f "$PDB" ]] || set_password "$FTP_PASSWORD"
   echo
   echo "Done. Copy certs/cacert.pem to the root of the camera's card and import it. Then: ./sonyftp start"
 }
 
+# Kill session processes of this instance too: a camera session that is still
+# connected survives the listener and keeps the port bound.
+kill_sessions() {
+  sudo pkill -f "pure-ftp[d] .*--pidfile $PIDFILE" 2>/dev/null || true
+}
+
 cmd_start() {
   need
   [[ -f "$PDB" && -f "$SERVER_PEM" ]] || die "run ./sonyftp setup first"
-  running && { echo "already running (pid $(cat "$PIDFILE"))"; return; }
+  if running; then ocsp_start; echo "already running (pid $(cat "$PIDFILE"))"; return; fi
   local ip; ip="$(lan_ip)"
-  if [[ -n "$ip" ]] && ! cert_has_ip "$ip"; then
-    echo "IP is now $ip — reissuing server cert. Update the Hostname on the camera."
+  if [[ -n "$ip" ]] && ! cert_ok "$ip"; then
+    echo "Server cert does not match $ip / OCSP port $OCSP_PORT — reissuing. Check the Hostname on the camera."
     make_server_cert
   fi
   echo "Starting pure-ftpd (sudo: port $PORT + per-user privilege drop)..."
   fw_open
+  ocsp_start
+  kill_sessions; sleep 1   # leftovers from an earlier run would hold the port
   sudo "$PUREFTPD" \
     --bind ",$PORT" \
     --login "puredb:$PDB" \
@@ -157,19 +218,25 @@ cmd_start() {
     --pidfile "$PIDFILE" \
     --daemonize
   sleep 1
-  running || die "server failed to start (check system log)"
+  running || { ocsp_stop; die "server failed to start — is port $PORT already in use? (check system log)"; }
   cmd_status
 }
 
 cmd_stop() {
-  if running; then sudo kill "$(cat "$PIDFILE")"; sleep 1; echo "stopped"; else echo "not running"; fi
-  [[ -n "$PUREFTPD" ]] && sudo pkill -f "^$(realpath "$PUREFTPD")" 2>/dev/null || true
+  if running; then
+    local pid; pid="$(cat "$PIDFILE")"
+    sudo pkill -P "$pid" 2>/dev/null || true
+    sudo kill "$pid"; sleep 1; echo "stopped"
+  else echo "not running"; fi
+  kill_sessions
   sudo rm -f "$PIDFILE" 2>/dev/null || true
+  ocsp_stop
   fw_close
 }
 
 cmd_status() {
   if running; then echo "RUNNING (pid $(cat "$PIDFILE"))"; else echo "STOPPED"; fi
+  if ocsp_running; then echo "  OCSP responder: running (port $OCSP_PORT)"; else echo "  OCSP responder: stopped"; fi
   echo "  Camera → Host: $(lan_ip)  Port: $PORT  Secure Protocol: On  Passive: On"
   echo "           User: $FTP_USER  Password: FTP_PASSWORD in .env"
   echo "  Uploads → $UPLOAD_DIR"
@@ -183,6 +250,10 @@ cmd_test() {
     && echo "OK: FTPS upload with verified cert"
   if curl --silent -u "$FTP_USER:$FTP_PASSWORD" "ftp://$ip:$PORT/" >/dev/null 2>&1; then
     echo "WARNING: plaintext login accepted!"; else echo "OK: plaintext FTP refused"; fi
+  if "$OPENSSL" ocsp -issuer "$CERTS/ca.crt" -cert "$CERTS/server.crt" -CAfile "$CERTS/ca.crt" \
+       -url "http://$ip:$OCSP_PORT" 2>/dev/null | grep -q ': good'; then
+    echo "OK: OCSP responder says the cert is good"
+  else echo "FAIL: no 'good' answer from the OCSP responder on port $OCSP_PORT (camera will show Root Certificate Error)"; fi
   rm -f "$f" "$UPLOAD_DIR/_sonyftp_test.txt"
 }
 
