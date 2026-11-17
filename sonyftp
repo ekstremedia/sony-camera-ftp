@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# sonyftp — on-demand FTPS server for Sony cameras (pure-ftpd). macOS + Linux.
+#
+#   ./sonyftp setup     one-time: .env, CA + server cert, FTP user, upload dir
+#   ./sonyftp start     start the server (uses sudo)
+#   ./sonyftp stop      stop the server
+#   ./sonyftp status    show state and the settings to enter on the camera
+#   ./sonyftp log       follow the transfer log
+#   ./sonyftp passwd    generate a new FTP password
+#   ./sonyftp cert      reissue the server cert (e.g. after an IP change)
+#   ./sonyftp test      verify FTPS upload works and plain FTP is refused
+set -euo pipefail
+
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$BASE/.env"
+CONF="$BASE/config"; CERTS="$BASE/certs"; RUN="$BASE/run"; LOGS="$BASE/logs"
+
+# ---- settings (override in .env) ----
+UPLOAD_DIR="$HOME/Pictures/SonyA7IV"
+FTP_USER="a7iv"
+FTP_PASSWORD=""
+PORT=21
+PASV_PORTS="50000:50010"
+IFACE=""
+if [[ -f "$ENV_FILE" ]]; then set -a; source "$ENV_FILE"; set +a; fi
+UPLOAD_DIR="${UPLOAD_DIR/#\~/$HOME}"
+
+OS="$(uname -s)"
+find_bin() { for c in "$@"; do [[ -x "$c" ]] && { echo "$c"; return; }; command -v "$c" 2>/dev/null && return; done; echo ""; }
+PUREFTPD="$(find_bin /opt/homebrew/opt/pure-ftpd/sbin/pure-ftpd /usr/local/opt/pure-ftpd/sbin/pure-ftpd /usr/sbin/pure-ftpd pure-ftpd)"
+PUREPW="$(find_bin /opt/homebrew/bin/pure-pw /usr/local/bin/pure-pw /usr/bin/pure-pw pure-pw)"
+OPENSSL="$(find_bin /opt/homebrew/opt/openssl@4/bin/openssl /opt/homebrew/opt/openssl@3/bin/openssl openssl)"
+
+PIDFILE="$RUN/pure-ftpd.pid"
+PDB="$CONF/pureftpd.pdb"; PASSWD="$CONF/pureftpd.passwd"
+SERVER_PEM="$CERTS/pure-ftpd.pem"
+
+die() { echo "error: $*" >&2; exit 1; }
+need() { [[ -n "$PUREFTPD" && -n "$PUREPW" && -n "$OPENSSL" ]] || die "missing pure-ftpd/pure-pw/openssl (see README)"; }
+hostname_s() { if [[ $OS == Darwin ]]; then scutil --get LocalHostName; else hostname -s; fi; }
+lan_ip() {
+  if [[ $OS == Darwin ]]; then
+    local i="${IFACE:-$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')}"
+    ipconfig getifaddr "${i:-en0}" 2>/dev/null || true
+  elif [[ -n "$IFACE" ]]; then
+    ip -4 -o addr show "$IFACE" | awk '{sub(/\/.*/,"",$4); print $4; exit}'
+  else
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}'
+  fi
+}
+running() { [[ -f "$PIDFILE" ]] && ps -p "$(cat "$PIDFILE")" >/dev/null 2>&1; }
+random_pw() { "$OPENSSL" rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 16; }
+cert_has_ip() { [[ -f "$CERTS/server.crt" ]] && "$OPENSSL" x509 -in "$CERTS/server.crt" -noout -text | grep -Eq "IP Address:$1(,|$)"; }
+
+set_env() {  # set_env KEY VALUE — update or append in .env
+  local tmp; tmp="$(mktemp)"
+  awk -v k="$1" -v v="$2" 'BEGIN{d=0} $0 ~ "^"k"=" {print k"=\""v"\""; d=1; next} {print} END{if(!d) print k"=\""v"\""}' "$ENV_FILE" > "$tmp"
+  mv "$tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+}
+
+make_ca() {
+  [[ -f "$CERTS/ca.key" ]] && return
+  echo "Creating private root CA..."
+  "$OPENSSL" req -x509 -new -newkey rsa:2048 -nodes -sha256 -days 3650 \
+    -keyout "$CERTS/ca.key" -out "$CERTS/ca.crt" \
+    -subj "/CN=SonyFTP Local Root CA ($(hostname_s))" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+  chmod 600 "$CERTS/ca.key"
+  cp "$CERTS/ca.crt" "$CERTS/cacert.pem"   # file name the camera expects on the card
+}
+
+make_server_cert() {
+  local ip host; ip="$(lan_ip)"; host="$(hostname_s)"
+  [[ -n "$ip" ]] || die "could not detect LAN IP (set IFACE in .env)"
+  echo "Issuing server certificate for $ip / $host.local ..."
+  "$OPENSSL" req -new -newkey rsa:2048 -nodes -sha256 \
+    -keyout "$CERTS/server.key" -out "$CERTS/server.csr" -subj "/CN=$ip" 2>/dev/null
+  "$OPENSSL" x509 -req -in "$CERTS/server.csr" -CA "$CERTS/ca.crt" -CAkey "$CERTS/ca.key" \
+    -CAcreateserial -out "$CERTS/server.crt" -days 825 -sha256 \
+    -extfile <(printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:%s,DNS:%s.local,DNS:%s\n' "$ip" "$host" "$host") 2>/dev/null
+  rm -f "$CERTS/server.csr"
+  cat "$CERTS/server.key" "$CERTS/server.crt" "$CERTS/ca.crt" > "$SERVER_PEM"
+  chmod 600 "$CERTS/server.key" "$SERVER_PEM"
+}
+
+set_password() {  # set_password [password] — empty → random
+  local pw="${1:-$(random_pw)}"
+  rm -f "$PASSWD" "$PDB"
+  printf '%s\n%s\n' "$pw" "$pw" | "$PUREPW" useradd "$FTP_USER" -u "$(id -u)" -g "$(id -g)" \
+    -d "$UPLOAD_DIR" -f "$PASSWD" -F "$PDB" -m >/dev/null 2>&1 || die "pure-pw failed"
+  chmod 600 "$PASSWD" "$PDB"
+  set_env FTP_PASSWORD "$pw"; FTP_PASSWORD="$pw"
+  echo "FTP user: $FTP_USER   password: $pw   (stored in .env)"
+}
+
+fw_open() {
+  if [[ $OS == Darwin ]]; then
+    local real; real="$(realpath "$PUREFTPD")"
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$real" >/dev/null 2>&1 || true
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$real" >/dev/null 2>&1 || true
+  elif command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
+    sudo ufw allow "$PORT/tcp" >/dev/null; sudo ufw allow "$PASV_PORTS/tcp" >/dev/null
+  elif command -v firewall-cmd >/dev/null && sudo firewall-cmd --state >/dev/null 2>&1; then
+    sudo firewall-cmd --add-port="$PORT/tcp" --add-port="${PASV_PORTS/:/-}/tcp" >/dev/null   # runtime only
+  fi
+}
+
+fw_close() {
+  [[ $OS == Darwin ]] && return
+  if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
+    sudo ufw delete allow "$PORT/tcp" >/dev/null 2>&1 || true
+    sudo ufw delete allow "$PASV_PORTS/tcp" >/dev/null 2>&1 || true
+  elif command -v firewall-cmd >/dev/null && sudo firewall-cmd --state >/dev/null 2>&1; then
+    sudo firewall-cmd --remove-port="$PORT/tcp" --remove-port="${PASV_PORTS/:/-}/tcp" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_setup() {
+  need
+  [[ -f "$ENV_FILE" ]] || { cp "$BASE/.env.example" "$ENV_FILE"; chmod 600 "$ENV_FILE"; echo "Created .env from .env.example"; }
+  mkdir -p "$CONF" "$CERTS" "$RUN" "$LOGS" "$UPLOAD_DIR"
+  chmod 700 "$CONF" "$CERTS"
+  make_ca
+  cert_has_ip "$(lan_ip)" || make_server_cert
+  [[ -f "$PDB" ]] || set_password "$FTP_PASSWORD"
+  echo
+  echo "Done. Copy certs/cacert.pem to the root of the camera's card and import it. Then: ./sonyftp start"
+}
+
+cmd_start() {
+  need
+  [[ -f "$PDB" && -f "$SERVER_PEM" ]] || die "run ./sonyftp setup first"
+  running && { echo "already running (pid $(cat "$PIDFILE"))"; return; }
+  local ip; ip="$(lan_ip)"
+  if [[ -n "$ip" ]] && ! cert_has_ip "$ip"; then
+    echo "IP is now $ip — reissuing server cert. Update the Hostname on the camera."
+    make_server_cert
+  fi
+  echo "Starting pure-ftpd (sudo: port $PORT + per-user privilege drop)..."
+  fw_open
+  sudo "$PUREFTPD" \
+    --bind ",$PORT" \
+    --login "puredb:$PDB" \
+    --noanonymous \
+    --chrooteveryone \
+    --tls 3 \
+    --certfile "$SERVER_PEM" \
+    --passiveportrange "$PASV_PORTS" \
+    --maxclientsnumber 4 --maxclientsperip 2 \
+    --maxidletime 15 \
+    --dontresolve \
+    --nochmod \
+    --prohibitdotfileswrite \
+    --umask 133:022 \
+    --altlog "clf:$LOGS/transfer.log" \
+    --pidfile "$PIDFILE" \
+    --daemonize
+  sleep 1
+  running || die "server failed to start (check system log)"
+  cmd_status
+}
+
+cmd_stop() {
+  if running; then sudo kill "$(cat "$PIDFILE")"; sleep 1; echo "stopped"; else echo "not running"; fi
+  [[ -n "$PUREFTPD" ]] && sudo pkill -f "^$(realpath "$PUREFTPD")" 2>/dev/null || true
+  sudo rm -f "$PIDFILE" 2>/dev/null || true
+  fw_close
+}
+
+cmd_status() {
+  if running; then echo "RUNNING (pid $(cat "$PIDFILE"))"; else echo "STOPPED"; fi
+  echo "  Camera → Host: $(lan_ip)  Port: $PORT  Secure Protocol: On  Passive: On"
+  echo "           User: $FTP_USER  Password: FTP_PASSWORD in .env"
+  echo "  Uploads → $UPLOAD_DIR"
+}
+
+cmd_test() {
+  running || die "server not running"
+  local ip f; ip="$(lan_ip)"; f="$(mktemp)"; echo "sonyftp test $(date)" > "$f"
+  curl --fail --silent --show-error --ssl-reqd --cacert "$CERTS/ca.crt" \
+    -u "$FTP_USER:$FTP_PASSWORD" -T "$f" "ftp://$ip:$PORT/_sonyftp_test.txt" \
+    && echo "OK: FTPS upload with verified cert"
+  if curl --silent -u "$FTP_USER:$FTP_PASSWORD" "ftp://$ip:$PORT/" >/dev/null 2>&1; then
+    echo "WARNING: plaintext login accepted!"; else echo "OK: plaintext FTP refused"; fi
+  rm -f "$f" "$UPLOAD_DIR/_sonyftp_test.txt"
+}
+
+case "${1:-}" in
+  setup)  cmd_setup ;;
+  start)  cmd_start ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  log)    mkdir -p "$LOGS"; touch "$LOGS/transfer.log"; tail -f "$LOGS/transfer.log" ;;
+  passwd) need; set_password; running && echo "restart to apply: ./sonyftp stop && ./sonyftp start" || true ;;
+  cert)   need; make_server_cert; running && echo "restart to apply: ./sonyftp stop && ./sonyftp start" || true ;;
+  test)   cmd_test ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

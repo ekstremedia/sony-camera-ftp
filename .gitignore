@@ -1,0 +1,7 @@
+# secrets & machine-specific state
+.env
+certs/
+config/
+run/
+logs/
+.DS_Store
