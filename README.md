@@ -2,6 +2,8 @@
 
 A secure FTPS server you start when you need it, for uploading photos from a Sony camera. Runs on macOS and Linux and is built on [pure-ftpd](https://www.pureftpd.org/). Verified with an A7 IV.
 
+![./sonyftp status in a terminal, next to a Sony A7 IV transferring photos to the Mac](img/example.jpg)
+
 - Uses TLS only (logins and file data); plain FTP is refused
 - The camera verifies the server against your own private root CA, with no "Root Certificate Error"
 - A single virtual FTP user, confined to the upload folder
