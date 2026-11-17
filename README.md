@@ -1,4 +1,4 @@
-# sonyftp
+# sony camera secure ftp server guide
 
 A secure FTPS server you start when you need it, for uploading photos from a Sony camera. Runs on macOS and Linux and is built on [pure-ftpd](https://www.pureftpd.org/). Verified with an A7 IV.
 
