@@ -26,6 +26,8 @@ Settings live in `.env` (see `.env.example`). The password, certificates and key
 ./sonyftp cert     # new server cert (start does this automatically if the IP changed)
 ```
 
+Output is colour-coded on a terminal. Set `NO_COLOR=1` to turn it off.
+
 ## Camera (A7 IV)
 
 1. Copy `certs/cacert.pem` to the root of the memory card in **slot 1**, then go to **Network → Network Option → Import Root Certificate**.

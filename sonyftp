@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
 # sonyftp — on-demand FTPS server for Sony cameras (pure-ftpd). macOS + Linux.
-#
-#   ./sonyftp setup     one-time: .env, CA + server cert, FTP user, upload dir
-#   ./sonyftp start     start the server (uses sudo)
-#   ./sonyftp stop      stop the server
-#   ./sonyftp status    show state and the settings to enter on the camera
-#   ./sonyftp log       follow the transfer log
-#   ./sonyftp passwd    generate a new FTP password
-#   ./sonyftp cert      reissue the server cert (e.g. after an IP change)
-#   ./sonyftp test      verify FTPS upload, OCSP answer, and that plain FTP is refused
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,8 +32,44 @@ OCSP_PID="$RUN/ocsp.pid"
 PDB="$CONF/pureftpd.pdb"; PASSWD="$CONF/pureftpd.passwd"
 SERVER_PEM="$CERTS/pure-ftpd.pem"
 INDEX="$CERTS/index.txt"   # certificate status database read by the OCSP responder
+XFERLOG="$LOGS/transfer.log"
 
-die() { echo "error: $*" >&2; exit 1; }
+# ---- output: colour on a terminal (NO_COLOR turns it off, CLICOLOR_FORCE=1 forces it) ----
+BOLD="" DIM="" RED="" GRN="" YEL="" CYN="" RST=""
+if [[ -z "${NO_COLOR:-}" ]] && { [[ -t 1 && "${TERM:-dumb}" != dumb ]] || [[ "${CLICOLOR_FORCE:-0}" == 1 ]]; }; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; RST=$'\033[0m'
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]*) S_OK="✓"; S_FAIL="✗"; S_WARN="!"; S_ARROW="→"; S_DOT="●"; S_UP="↑"; S_DOWN="↓" ;;
+  *)              S_OK="+"; S_FAIL="x"; S_WARN="!"; S_ARROW="->"; S_DOT="*"; S_UP="^"; S_DOWN="v" ;;
+esac
+ok()   { printf '%s %s\n' "${GRN}${S_OK}${RST}" "$*"; }
+fail() { printf '%s %s\n' "${RED}${S_FAIL}${RST}" "$*"; }
+warn() { printf '%s %s\n' "${YEL}${S_WARN}${RST}" "$*"; }
+info() { printf '%s %s\n' "${CYN}${S_ARROW}${RST}" "$*"; }
+hint() { printf '  %s\n' "${DIM}$*${RST}"; }
+die()  { printf '%s %s\n' "${RED}${S_FAIL} error:${RST}" "$*" >&2; exit 1; }
+row()  { printf '    %-16s %s\n' "$1" "${BOLD}$2${RST}"; }
+svc()  {  # svc <name> <1|0> [detail]
+  if [[ $2 == 1 ]]; then printf '  %s %-15s %s  %s\n' "${GRN}${S_DOT}${RST}" "$1" "${GRN}running${RST}" "${DIM}${3:-}${RST}"
+  else printf '  %s %-15s %s\n' "${RED}${S_DOT}${RST}" "$1" "${RED}stopped${RST}"; fi
+}
+
+usage() {
+  printf '%s\n\n' "${BOLD}sonyftp${RST} — on-demand FTPS server for Sony cameras"
+  local c
+  while IFS='|' read -r c d; do printf '  %s  %s\n' "${CYN}$(printf '%-7s' "$c")${RST}" "$d"; done <<'EOF'
+setup|one-time: .env, certificates, FTP user, upload folder
+start|start the server (uses sudo)
+stop|stop the server
+status|show state and the settings to enter on the camera
+log|follow uploads as they arrive
+passwd|generate a new FTP password
+cert|reissue the server certificate (e.g. after an IP change)
+test|check FTPS upload, the OCSP answer, and that plain FTP is refused
+EOF
+}
+
 need() { [[ -n "$PUREFTPD" && -n "$PUREPW" && -n "$OPENSSL" ]] || die "missing pure-ftpd/pure-pw/openssl (see README)"; }
 hostname_s() { if [[ $OS == Darwin ]]; then scutil --get LocalHostName; else hostname -s; fi; }
 lan_ip() {
@@ -82,7 +109,6 @@ backdate() {
 
 make_ca() {
   [[ -f "$CERTS/ca.key" ]] && return
-  echo "Creating private root CA..."
   # shellcheck disable=SC2046
   "$OPENSSL" req -x509 -new -newkey rsa:2048 -nodes -sha256 -days 3650 $(backdate) \
     -keyout "$CERTS/ca.key" -out "$CERTS/ca.crt" \
@@ -92,6 +118,7 @@ make_ca() {
     -addext "subjectKeyIdentifier=hash" 2>/dev/null
   chmod 600 "$CERTS/ca.key"
   cp "$CERTS/ca.crt" "$CERTS/cacert.pem"   # file name the camera expects on the card
+  ok "Created private root CA ${DIM}(certs/cacert.pem goes on the camera)${RST}"
 }
 
 # The camera rejects the cert ("Root Certificate Error") unless it can check revocation:
@@ -99,7 +126,6 @@ make_ca() {
 make_server_cert() {
   local ip host serial; ip="$(lan_ip)"; host="$(hostname_s)"
   [[ -n "$ip" ]] || die "could not detect LAN IP (set IFACE in .env)"
-  echo "Issuing server certificate for $ip / $host.local ..."
   "$OPENSSL" req -new -newkey rsa:2048 -nodes -sha256 \
     -keyout "$CERTS/server.key" -out "$CERTS/server.csr" -subj "/CN=$ip" 2>/dev/null
   # shellcheck disable=SC2046
@@ -114,6 +140,7 @@ make_server_cert() {
   printf 'V\t%s\t\t%s\tunknown\t/CN=%s\n' "$(utc_offset +397 %y%m%d%H%M%SZ)" "$serial" "$ip" > "$INDEX"
   echo 'unique_subject = no' > "$INDEX.attr"
   if ocsp_running; then ocsp_stop; ocsp_start; fi   # responder reads the database at startup
+  ok "Issued server certificate for ${BOLD}$ip${RST}"
 }
 
 ocsp_start() {
@@ -138,7 +165,7 @@ set_password() {  # set_password [password] — empty → random
     -d "$UPLOAD_DIR" -f "$PASSWD" -F "$PDB" -m >/dev/null 2>&1 || die "pure-pw failed"
   chmod 600 "$PASSWD" "$PDB"
   set_env FTP_PASSWORD "$pw"; FTP_PASSWORD="$pw"
-  echo "FTP user: $FTP_USER   password: $pw   (stored in .env)"
+  ok "FTP user ${BOLD}$FTP_USER${RST}, password ${BOLD}$pw${RST} ${DIM}(stored in .env)${RST}"
 }
 
 fw_open() {
@@ -171,14 +198,16 @@ fw_close() {
 
 cmd_setup() {
   need
-  [[ -f "$ENV_FILE" ]] || { cp "$BASE/.env.example" "$ENV_FILE"; chmod 600 "$ENV_FILE"; echo "Created .env from .env.example"; }
+  [[ -f "$ENV_FILE" ]] || { cp "$BASE/.env.example" "$ENV_FILE"; chmod 600 "$ENV_FILE"; ok "Created .env from .env.example"; }
   mkdir -p "$CONF" "$CERTS" "$RUN" "$LOGS" "$UPLOAD_DIR"
   chmod 700 "$CONF" "$CERTS"
   make_ca
   cert_ok "$(lan_ip)" || make_server_cert
   [[ -f "$PDB" ]] || set_password "$FTP_PASSWORD"
+  ok "Setup complete"
   echo
-  echo "Done. Copy certs/cacert.pem to the root of the camera's card and import it. Then: ./sonyftp start"
+  info "Copy ${BOLD}certs/cacert.pem${RST} to the root of the camera's card (slot 1) and import it"
+  info "Then run ${BOLD}./sonyftp start${RST}"
 }
 
 # Kill session processes of this instance too: a camera session that is still
@@ -190,16 +219,17 @@ kill_sessions() {
 cmd_start() {
   need
   [[ -f "$PDB" && -f "$SERVER_PEM" ]] || die "run ./sonyftp setup first"
-  if running; then ocsp_start; echo "already running (pid $(cat "$PIDFILE"))"; return; fi
+  if running; then ocsp_start; warn "Already running"; cmd_status; return; fi
   local ip; ip="$(lan_ip)"
   if [[ -n "$ip" ]] && ! cert_ok "$ip"; then
-    echo "Server cert does not match $ip / OCSP port $OCSP_PORT — reissuing. Check the Hostname on the camera."
+    warn "Server certificate does not match ${BOLD}$ip${RST} — reissuing. Check the Hostname on the camera."
     make_server_cert
   fi
-  echo "Starting pure-ftpd (sudo: port $PORT + per-user privilege drop)..."
+  info "Starting ${DIM}(sudo is needed for port $PORT)${RST}"
   fw_open
   ocsp_start
   kill_sessions; sleep 1   # leftovers from an earlier run would hold the port
+  mkdir -p "$LOGS"; touch "$XFERLOG" 2>/dev/null || true
   sudo "$PUREFTPD" \
     --bind ",$PORT" \
     --login "puredb:$PDB" \
@@ -214,47 +244,94 @@ cmd_start() {
     --nochmod \
     --prohibitdotfileswrite \
     --umask 133:022 \
-    --altlog "clf:$LOGS/transfer.log" \
+    --altlog "clf:$XFERLOG" \
     --pidfile "$PIDFILE" \
     --daemonize
   sleep 1
   running || { ocsp_stop; die "server failed to start — is port $PORT already in use? (check system log)"; }
+  sudo chown "$(id -u)" "$XFERLOG" 2>/dev/null || true   # so ./sonyftp log works without sudo
+  ok "Started"
   cmd_status
 }
 
 cmd_stop() {
+  local was=0
   if running; then
-    local pid; pid="$(cat "$PIDFILE")"
+    local pid; pid="$(cat "$PIDFILE")"; was=1
     sudo pkill -P "$pid" 2>/dev/null || true
-    sudo kill "$pid"; sleep 1; echo "stopped"
-  else echo "not running"; fi
+    sudo kill "$pid"; sleep 1
+  fi
   kill_sessions
   sudo rm -f "$PIDFILE" 2>/dev/null || true
   ocsp_stop
   fw_close
+  if [[ $was == 1 ]]; then ok "Stopped"; else warn "Was not running"; fi
 }
 
 cmd_status() {
-  if running; then echo "RUNNING (pid $(cat "$PIDFILE"))"; else echo "STOPPED"; fi
-  if ocsp_running; then echo "  OCSP responder: running (port $OCSP_PORT)"; else echo "  OCSP responder: stopped"; fi
-  echo "  Camera → Host: $(lan_ip)  Port: $PORT  Secure Protocol: On  Passive: On"
-  echo "           User: $FTP_USER  Password: FTP_PASSWORD in .env"
-  echo "  Uploads → $UPLOAD_DIR"
+  local ip dir="$UPLOAD_DIR"; ip="$(lan_ip)"
+  if [[ $dir == "$HOME"* ]]; then dir="~${dir#"$HOME"}"; fi
+  echo
+  if running; then svc "FTP server" 1 "pid $(cat "$PIDFILE"), port $PORT"; else svc "FTP server" 0; fi
+  if ocsp_running; then svc "OCSP responder" 1 "port $OCSP_PORT"; else svc "OCSP responder" 0; fi
+  echo
+  printf '  %s\n' "${BOLD}Camera settings${RST}"
+  row "Hostname" "${ip:-unknown}"
+  row "Port" "$PORT"
+  row "Secure Protocol" "On"
+  row "Passive Mode" "On"
+  row "User" "$FTP_USER"
+  row "Password" "${RST}${DIM}FTP_PASSWORD in .env"
+  echo
+  printf '  %s\n' "${BOLD}Uploads${RST} ${CYN}${S_ARROW}${RST} $dir"
+  if [[ -z "$ip" ]]; then echo; warn "No LAN IP found (set IFACE in .env)"
+  elif [[ -f "$CERTS/server.crt" ]] && ! cert_ok "$ip"; then
+    echo; warn "Certificate does not match ${BOLD}$ip${RST} — ./sonyftp start will reissue it"
+  fi
+  echo
 }
 
 cmd_test() {
   running || die "server not running"
-  local ip f; ip="$(lan_ip)"; f="$(mktemp)"; echo "sonyftp test $(date)" > "$f"
-  curl --fail --silent --show-error --ssl-reqd --cacert "$CERTS/ca.crt" \
-    -u "$FTP_USER:$FTP_PASSWORD" -T "$f" "ftp://$ip:$PORT/_sonyftp_test.txt" \
-    && echo "OK: FTPS upload with verified cert"
+  local ip f fails=0; ip="$(lan_ip)"; f="$(mktemp)"; echo "sonyftp test $(date)" > "$f"
+  if curl --fail --silent --show-error --ssl-reqd --cacert "$CERTS/ca.crt" \
+       -u "$FTP_USER:$FTP_PASSWORD" -T "$f" "ftp://$ip:$PORT/_sonyftp_test.txt"; then
+    ok "FTPS upload with verified certificate"
+  else fail "FTPS upload failed"; fails=$((fails+1)); fi
   if curl --silent -u "$FTP_USER:$FTP_PASSWORD" "ftp://$ip:$PORT/" >/dev/null 2>&1; then
-    echo "WARNING: plaintext login accepted!"; else echo "OK: plaintext FTP refused"; fi
+    fail "Plain FTP login was accepted"; fails=$((fails+1))
+  else ok "Plain FTP refused"; fi
   if "$OPENSSL" ocsp -issuer "$CERTS/ca.crt" -cert "$CERTS/server.crt" -CAfile "$CERTS/ca.crt" \
        -url "http://$ip:$OCSP_PORT" 2>/dev/null | grep -q ': good'; then
-    echo "OK: OCSP responder says the cert is good"
-  else echo "FAIL: no 'good' answer from the OCSP responder on port $OCSP_PORT (camera will show Root Certificate Error)"; fi
+    ok "OCSP responder says the certificate is good"
+  else
+    fail "No 'good' answer from the OCSP responder on port $OCSP_PORT"
+    hint "the camera will show Root Certificate Error"; fails=$((fails+1))
+  fi
   rm -f "$f" "$UPLOAD_DIR/_sonyftp_test.txt"
+  if [[ $fails -gt 0 ]]; then exit 1; fi
+}
+
+# Turn pure-ftpd's CLF lines into: time, direction, path, size.
+cmd_log() {
+  mkdir -p "$LOGS"; touch "$XFERLOG" 2>/dev/null || true
+  local tail_cmd=(tail -n 20 -f "$XFERLOG")
+  if [[ ! -r "$XFERLOG" ]]; then tail_cmd=(sudo "${tail_cmd[@]}"); fi
+  info "Following uploads ${DIM}(Ctrl-C to stop)${RST}"
+  "${tail_cmd[@]}" | awk -v root="$UPLOAD_DIR/" -v up="${GRN}${S_UP}${RST}" -v down="${CYN}${S_DOWN}${RST}" \
+      -v dim="$DIM" -v bold="$BOLD" -v rst="$RST" '
+    function human(b) { if (b >= 1073741824) return sprintf("%.2f GB", b/1073741824)
+                        if (b >= 1048576) return sprintf("%.1f MB", b/1048576)
+                        if (b >= 1024) return sprintf("%.0f KB", b/1024); return b " B" }
+    {
+      n = split($0, q, "\""); t = $0
+      if (n < 3 || !match(t, /:[0-9][0-9]:[0-9][0-9]:[0-9][0-9] /)) { print; fflush(); next }
+      time = substr(t, RSTART + 1, 8)
+      split(q[2], req, " "); path = req[2]; gsub(/\/\/+/, "/", path)
+      if (index(path, root) == 1) path = substr(path, length(root) + 1)
+      printf "%s%s%s  %s  %s%s%s  %s%s%s\n", dim, time, rst, (req[1] == "PUT" ? up : down), bold, path, rst, dim, human($NF), rst
+      fflush()
+    }'
 }
 
 case "${1:-}" in
@@ -262,9 +339,9 @@ case "${1:-}" in
   start)  cmd_start ;;
   stop)   cmd_stop ;;
   status) cmd_status ;;
-  log)    mkdir -p "$LOGS"; touch "$LOGS/transfer.log"; tail -f "$LOGS/transfer.log" ;;
-  passwd) need; set_password; running && echo "restart to apply: ./sonyftp stop && ./sonyftp start" || true ;;
-  cert)   need; make_server_cert; running && echo "restart to apply: ./sonyftp stop && ./sonyftp start" || true ;;
+  log)    cmd_log ;;
+  passwd) need; set_password; if running; then info "Restart to apply: ./sonyftp stop && ./sonyftp start"; fi ;;
+  cert)   need; make_server_cert; if running; then info "Restart to apply: ./sonyftp stop && ./sonyftp start"; fi ;;
   test)   cmd_test ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)      usage; [[ "${1:-}" =~ ^(-h|--help|help)$ ]] || exit 1 ;;
 esac
